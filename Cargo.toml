@@ -20,3 +20,6 @@ winit = "0.30"
 [profile.release]
 lto = "thin"
 strip = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = { version = "0.22", default-features = false }

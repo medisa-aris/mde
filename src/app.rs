@@ -6,8 +6,10 @@ use std::time::Instant;
 use egui::{Key, KeyboardShortcut, Modifiers, ThemePreference};
 use egui_commonmark::CommonMarkCache;
 
+use crate::chrome;
 use crate::document::Document;
 use crate::editor::Editor;
+use crate::menu::{Command, MenuBar};
 use crate::preview::mermaid::Diagrams;
 use crate::preview::view::Preview;
 use crate::theme;
@@ -15,6 +17,14 @@ use crate::worker::Worker;
 
 /// Seconds after the last scroll input during which the panes keep syncing.
 const SCROLL_SETTLE: f64 = 0.3;
+
+const SHORTCUTS: &str = "\
+Cmd+1, 2, 3 — Editor, Split, Preview
+Cmd+N, O — New, Open
+Cmd+S, Shift+Cmd+S — Save, Save As
+Cmd+W, Q — Close tab, Quit
+Cmd+Z, Shift+Cmd+Z — Undo, Redo
+Tab, Shift+Tab — Indent, Outdent";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
@@ -24,7 +34,7 @@ pub enum View {
 }
 
 impl View {
-    const ALL: [(View, &'static str, Key); 3] = [
+    pub const ALL: [(View, &'static str, Key); 3] = [
         (View::Editor, "Editor", Key::Num1),
         (View::Split, "Split", Key::Num2),
         (View::Preview, "Preview", Key::Num3),
@@ -45,7 +55,7 @@ enum Dialog {
     ConfirmClose(u64),
     ConfirmQuit,
     ConfirmOverwrite(u64),
-    Error(String),
+    Message(String),
 }
 
 struct Tab {
@@ -88,14 +98,21 @@ pub struct App {
     perf: bool,
     /// When the user last scrolled or dragged, in egui time.
     last_scroll: f64,
+    /// When the keyboard last moved the editor, in egui time.
+    last_caret_move: f64,
     started: Option<Instant>,
     title: String,
+    /// Absent in headless tests.
+    menu: Option<MenuBar>,
+    /// Actions chosen from the menu bar, run during the next frame.
+    pending: Vec<Action>,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>, started: Instant) -> Self {
         let theme = theme::load(cc.storage);
         cc.egui_ctx.set_theme(theme);
+        theme::install_fonts(&cc.egui_ctx);
         theme::apply_style(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let view = match cc.storage.and_then(|s| s.get_string("view")).as_deref() {
@@ -105,6 +122,10 @@ impl App {
         };
         let mut app = Self::with_context(&cc.egui_ctx, view, theme);
         app.started = Some(started);
+        match MenuBar::install(&cc.egui_ctx) {
+            Ok(menu) => app.menu = Some(menu),
+            Err(e) => eprintln!("mde: could not create the menu bar: {e}"),
+        }
         for path in files {
             app.open_path(path);
         }
@@ -125,8 +146,11 @@ impl App {
             diagrams: Diagrams::new(ctx.clone()),
             perf: std::env::var_os("MDE_PERF").is_some(),
             last_scroll: f64::NEG_INFINITY,
+            last_caret_move: f64::NEG_INFINITY,
             started: None,
             title: String::new(),
+            menu: None,
+            pending: Vec::new(),
         }
     }
 
@@ -134,7 +158,7 @@ impl App {
         let doc = match Document::open(&path) {
             Ok(doc) => doc,
             Err(e) => {
-                self.dialog = Some(Dialog::Error(format!(
+                self.dialog = Some(Dialog::Message(format!(
                     "Could not open {}: {e}",
                     path.display()
                 )));
@@ -179,7 +203,7 @@ impl App {
 
     /// Returns true when the document is on disk afterwards.
     fn save(&mut self, index: usize, choose_name: bool, overwrite: bool) -> bool {
-        let doc = &mut self.tabs[index].doc;
+        let doc = &self.tabs[index].doc;
         let result = if choose_name || doc.path.is_none() {
             let name = if doc.path.is_some() {
                 doc.title()
@@ -192,20 +216,20 @@ impl App {
             if let Some(dir) = doc.path.as_ref().and_then(|p| p.parent()) {
                 dialog = dialog.set_directory(dir);
             }
-            match dialog.save_file() {
-                Some(path) => doc.save_as(path),
+            match self.system_dialog(|| dialog.save_file()) {
+                Some(path) => self.tabs[index].doc.save_as(path),
                 None => return false,
             }
         } else if !overwrite && doc.changed_on_disk() {
             self.dialog = Some(Dialog::ConfirmOverwrite(doc.id));
             return false;
         } else {
-            doc.save()
+            self.tabs[index].doc.save()
         };
         match result {
             Ok(()) => true,
             Err(e) => {
-                self.dialog = Some(Dialog::Error(format!("Could not save: {e}")));
+                self.dialog = Some(Dialog::Message(format!("Could not save: {e}")));
                 false
             }
         }
@@ -218,10 +242,10 @@ impl App {
                 self.active = self.tabs.len() - 1;
             }
             Action::Open => {
-                let picked = rfd::FileDialog::new()
+                let dialog = rfd::FileDialog::new()
                     .add_filter("Markdown", &["md", "markdown", "mdown", "txt"])
-                    .add_filter("All files", &["*"])
-                    .pick_files();
+                    .add_filter("All files", &["*"]);
+                let picked = self.system_dialog(|| dialog.pick_files());
                 for path in picked.into_iter().flatten() {
                     self.open_path(path);
                 }
@@ -278,50 +302,87 @@ impl App {
         }
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) -> Option<Action> {
-        let mut action = None;
-        ui.horizontal(|ui| {
-            if ui.button("New").on_hover_text("Cmd+N").clicked() {
-                action = Some(Action::New);
+    fn header(&mut self, ui: &mut egui::Ui) -> Option<Action> {
+        let doc = &self.tabs[self.active].doc;
+        let (title, dirty) = (doc.title(), doc.is_dirty());
+        chrome::header(ui, &title, dirty, &mut self.view, &mut self.theme);
+
+        // As in other Mac apps, tabs appear once there is more than one.
+        if self.tabs.len() < 2 {
+            return None;
+        }
+        let tabs: Vec<chrome::Tab> = self
+            .tabs
+            .iter()
+            .map(|t| chrome::Tab {
+                id: t.doc.id,
+                title: t.doc.title(),
+                dirty: t.doc.is_dirty(),
+                path: t.doc.path.as_ref().map(|p| p.display().to_string()),
+            })
+            .collect();
+        match chrome::tab_bar(ui, &tabs, self.active)? {
+            chrome::TabAction::Select(i) => {
+                self.active = i;
+                None
             }
-            if ui.button("Open").on_hover_text("Cmd+O").clicked() {
-                action = Some(Action::Open);
-            }
-            if ui.button("Save").on_hover_text("Cmd+S").clicked() {
-                action = Some(Action::Save);
-            }
-            ui.separator();
-            for (i, (view, name, _)) in View::ALL.into_iter().enumerate() {
-                ui.selectable_value(&mut self.view, view, name)
-                    .on_hover_text(format!("Cmd+{}", i + 1));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                theme::menu(ui, &mut self.theme);
+            chrome::TabAction::Close(id) => Some(Action::CloseTab(id)),
+            chrome::TabAction::New => Some(Action::New),
+        }
+    }
+
+    /// Applies menu bar commands. Editing commands become the input events
+    /// the editor already understands.
+    fn menu_command(&mut self, ctx: &egui::Context, command: Command, input: &mut egui::RawInput) {
+        // A dialog takes all input until answered.
+        if self.dialog.is_some() {
+            return;
+        }
+        let mut key = |modifiers: Modifiers, key: Key| {
+            input.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
             });
-        });
-        ui.separator();
-        egui::ScrollArea::horizontal()
-            .id_salt("tabs")
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    for (i, tab) in self.tabs.iter().enumerate() {
-                        let dot = if tab.doc.is_dirty() { " •" } else { "" };
-                        let label = ui.selectable_label(i == self.active, tab.doc.title() + dot);
-                        let label = match &tab.doc.path {
-                            Some(path) => label.on_hover_text(path.display().to_string()),
-                            None => label,
-                        };
-                        if label.clicked() {
-                            self.active = i;
-                        }
-                        if label.middle_clicked() || ui.small_button("×").clicked() {
-                            action = Some(Action::CloseTab(tab.doc.id));
-                        }
-                        ui.add_space(8.0);
-                    }
-                });
-            });
-        action
+        };
+        match command {
+            Command::Undo => key(Modifiers::COMMAND, Key::Z),
+            Command::Redo => key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z),
+            Command::SelectAll => key(Modifiers::COMMAND, Key::A),
+            Command::Cut => input.events.push(egui::Event::Cut),
+            Command::Copy => input.events.push(egui::Event::Copy),
+            // The window system answers with a paste event.
+            Command::Paste => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+            Command::View(view) => self.view = view,
+            Command::Theme(theme) => {
+                self.theme = theme;
+                ctx.set_theme(theme);
+            }
+            Command::Shortcuts => self.dialog = Some(Dialog::Message(SHORTCUTS.into())),
+            Command::New => self.pending.push(Action::New),
+            Command::Open => self.pending.push(Action::Open),
+            Command::Save => self.pending.push(Action::Save),
+            Command::SaveAs => self.pending.push(Action::SaveAs),
+            Command::CloseTab => {
+                let id = self.tabs[self.active].doc.id;
+                self.pending.push(Action::CloseTab(id));
+            }
+            Command::Quit => self.pending.push(Action::Quit),
+        }
+    }
+
+    /// Runs a system file dialog with the menu bar it needs.
+    fn system_dialog<T>(&self, show: impl FnOnce() -> T) -> T {
+        if let Some(menu) = &self.menu {
+            menu.use_dialog_menu(true);
+        }
+        let result = show();
+        if let Some(menu) = &self.menu {
+            menu.use_dialog_menu(false);
+        }
+        result
     }
 
     fn body(&mut self, ui: &mut egui::Ui) {
@@ -333,6 +394,8 @@ impl App {
         });
         if scroll_input {
             self.last_scroll = now;
+            // Scrolling by hand takes over from the keyboard.
+            self.last_caret_move = f64::NEG_INFINITY;
         }
         let scrolling = now - self.last_scroll < SCROLL_SETTLE;
         let view = self.view;
@@ -382,7 +445,13 @@ impl App {
 
         // The pane under the pointer leads and the other follows.
         if let (Some(editor), Some(preview)) = (editor_out, preview_out) {
-            let leader = if editor.hovered {
+            if editor.followed_caret {
+                self.last_caret_move = now;
+            }
+            // While typing, the editor leads wherever the pointer happens to be.
+            let keyboard = now - self.last_caret_move < SCROLL_SETTLE;
+            let scrolling = scrolling || keyboard;
+            let leader = if keyboard || editor.hovered {
                 Some((editor.top_char, true))
             } else if preview.hovered {
                 Some((preview.top_char, false))
@@ -482,7 +551,7 @@ impl App {
                         }
                     });
                 }
-                Dialog::Error(message) => {
+                Dialog::Message(message) => {
                     ui.label(message);
                     ui.add_space(8.0);
                     if ui.button("OK").clicked() {
@@ -541,11 +610,20 @@ impl App {
         }
 
         let shortcut = self.shortcuts(&ctx);
-        let clicked = egui::Panel::top("toolbar")
-            .show(ui, |ui| self.toolbar(ui))
-            .inner;
-        if let Some(action) = shortcut.or(clicked) {
+        let header = egui::Panel::top("header")
+            .frame(egui::Frame::NONE)
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                self.header(ui)
+            });
+        let mut actions = std::mem::take(&mut self.pending);
+        actions.extend(shortcut.or(header.inner));
+        for action in actions {
             self.run(&ctx, action);
+        }
+        if let Some(menu) = &mut self.menu {
+            menu.sync(self.view, self.theme, false);
         }
         self.body(ui);
         self.dialogs(&ctx);
@@ -582,6 +660,23 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        let commands: Vec<Command> = match &self.menu {
+            Some(menu) => menu.commands().collect(),
+            None => return,
+        };
+        if commands.is_empty() {
+            return;
+        }
+        for command in commands {
+            self.menu_command(ctx, command, input);
+        }
+        if let Some(menu) = &mut self.menu {
+            menu.sync(self.view, self.theme, true);
+        }
+        ctx.request_repaint();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.frame(ui);
     }
@@ -657,6 +752,40 @@ mod tests {
     }
 
     #[test]
+    fn menu_commands_drive_the_app_and_the_editor() {
+        let (ctx, mut app) = app(View::Split);
+        frame(&ctx, &mut app, vec![]);
+        let id = egui::Id::unique(("editor", app.tabs[0].doc.id));
+        ctx.memory_mut(|m| m.request_focus(id));
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![egui::Event::Text("hello".into())]);
+
+        let choose = |app: &mut App, command: Command| {
+            let mut input = egui::RawInput::default();
+            app.menu_command(&ctx, command, &mut input);
+            frame(&ctx, app, input.events);
+        };
+        choose(&mut app, Command::SelectAll);
+        choose(&mut app, Command::Cut);
+        assert_eq!(app.tabs[0].doc.text, "");
+        choose(&mut app, Command::Undo);
+        assert_eq!(app.tabs[0].doc.text, "hello");
+        choose(&mut app, Command::Redo);
+        assert_eq!(app.tabs[0].doc.text, "");
+
+        choose(&mut app, Command::View(View::Preview));
+        assert_eq!(app.view, View::Preview);
+        choose(&mut app, Command::New);
+        assert_eq!(app.tabs.len(), 2);
+        app.tabs[1].doc.mark_changed();
+        choose(&mut app, Command::CloseTab);
+        assert!(matches!(app.dialog, Some(Dialog::ConfirmClose(_))));
+        // Nothing gets past an open dialog.
+        choose(&mut app, Command::New);
+        assert_eq!(app.tabs.len(), 2);
+    }
+
+    #[test]
     fn split_view_panes_scroll_together() {
         let (ctx, mut app) = app(View::Split);
         app.tabs[0].doc.text = (0..300).map(|i| format!("Paragraph {i}\n\n")).collect();
@@ -693,5 +822,18 @@ mod tests {
         assert!(from_editor > 100.0, "editor led to {from_editor}");
         let from_preview = scroll(&mut app, 800.0);
         assert!(from_preview > from_editor, "preview led to {from_preview}");
+
+        // Moving with the keyboard takes the preview along, even with the
+        // pointer resting over the preview.
+        let id = egui::Id::unique(("editor", app.tabs[0].doc.id));
+        ctx.memory_mut(|m| m.request_focus(id));
+        frame(&ctx, &mut app, vec![]);
+        frame(&ctx, &mut app, vec![]);
+        press(&ctx, &mut app, Modifiers::COMMAND, Key::ArrowDown);
+        for _ in 0..30 {
+            frame(&ctx, &mut app, vec![]);
+        }
+        let end = app.tabs[0].position;
+        assert!(end > from_preview, "keyboard led to {end}");
     }
 }

@@ -28,6 +28,8 @@ pub struct EditorOutput {
     /// Character index at the top of the visible area.
     pub top_char: f32,
     pub hovered: bool,
+    /// The keyboard moved the caret, so the view may have moved with it.
+    pub followed_caret: bool,
 }
 
 #[derive(Default)]
@@ -141,6 +143,7 @@ impl Editor {
         let id = egui::Id::unique(("editor", doc.id));
         let hovered = ui.rect_contains_pointer(ui.max_rect());
         let mut top_char = 0.0;
+        let mut followed_caret = false;
 
         if self.buffer.is_none() || self.revision != doc.revision() {
             self.buffer = Some(Buffer::new(&doc.text));
@@ -148,7 +151,11 @@ impl Editor {
             self.preedit = None;
         }
         let Some(mut buffer) = self.buffer.take() else {
-            return EditorOutput { top_char, hovered };
+            return EditorOutput {
+                top_char,
+                hovered,
+                followed_caret,
+            };
         };
 
         let font = egui::TextStyle::Monospace.resolve(ui.style());
@@ -245,7 +252,8 @@ impl Editor {
             top_char = buffer.lines()[line].chars as f32 + part * buffer.line_chars(line) as f32;
 
             let total = layout.top_of(&buffer, buffer.lines().len());
-            let reveal = std::mem::take(&mut self.reveal).then(|| {
+            followed_caret = std::mem::take(&mut self.reveal);
+            let reveal = followed_caret.then(|| {
                 let (line, rect) =
                     layout.caret(&buffer, &doc.text, buffer.selection.head, self.row_end);
                 let top = layout.top_of(&buffer, line);
@@ -285,7 +293,11 @@ impl Editor {
         });
 
         self.buffer = Some(buffer);
-        EditorOutput { top_char, hovered }
+        EditorOutput {
+            top_char,
+            hovered,
+            followed_caret,
+        }
     }
 
     /// Mouse selection. Returns how far to scroll while dragging past an edge.
